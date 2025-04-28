@@ -152,8 +152,7 @@ runs:
         GCP_CREDENTIALS: ${{ inputs.credentials }}
       run: |
         # Get all secrets from source repository
-        secrets=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/secrets" | jq -r '.secrets[].name')
+        secrets=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ github.repository }}/actions/secrets" | jq -r '.secrets[].name')
         for secret in $secrets; do gh secret set $secret --repo ${{ env.TARGET_REPOSITORY }} --body "${!secret}"; done
 
         #python -m pip -q install --upgrade pip
@@ -192,6 +191,10 @@ runs:
       id: variables
       shell: bash
       run: |
+        # Extract namespace/repo
+        NAMESPACE=${IMAGE_NAME%/*}
+        REPO_NAME=${IMAGE_NAME#*/}
+
         BASE_NAME=$(basename ${{ inputs.image_name }})
         IFS=', '; array=($(curl -L -s 'https://registry.hub.docker.com/v2/repositories/${{ inputs.image_name }}/tags?page_size=1024' | jq -rc '."results"[]["name"]' | yq eval -P | sed "s/ /, /g"))
         for ((i=0; i < ${#array[@]}; i++)); do
@@ -201,3 +204,20 @@ runs:
             echo "deleted: ${{ inputs.image_name }}:${array[$i]}"
           fi
         done
+
+        # Get all images sorted by date (oldest first)
+        IMAGES=$(curl -s -H "Authorization: JWT $HUB_TOKEN" \
+          "https://hub.docker.com/v2/repositories/$IMAGE_NAME/tags/?page_size=100&ordering=last_updated" \
+          | jq -r '.results[] | select(.images != null) | .images[0].digest' | head -n $MAX_DELETIONS)
+
+        # Delete exactly MAX_DELETIONS oldest images
+        DELETED=0
+        for SHA in $IMAGES; do
+          echo "🗑️ Deleting image $((DELETED+1))/$MAX_DELETIONS: $IMAGE_NAME@${SHA:0:12}..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: JWT $HUB_TOKEN" \
+            "https://hub.docker.com/v2/repositories/$IMAGE_NAME/manifests/$SHA")
+    
+          [ "$RESPONSE" -eq 202 ] && ((DELETED++)) || echo "❌ Failed (HTTP $RESPONSE)"
+        done
+        echo "✅ Successfully deleted $DELETED/$MAX_DELETIONS oldest images"
